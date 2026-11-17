@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query, Request, Response, status
+from fastapi import FastAPI, HTTPException, Path, Query, Request, Response, status
 
 from . import __version__
 from .config import Settings
@@ -21,8 +21,12 @@ from .models import (
     HealthView,
     NotificationList,
     NotificationView,
+    SilenceList,
+    SilenceStart,
+    SilenceStopView,
+    SilenceView,
 )
-from .service import AlarmService, ConflictError, NotFoundError
+from .service import AlarmService, ConflictError, InvalidStateError, NotFoundError
 from .worker import Dispatcher
 
 log = logging.getLogger("alarm")
@@ -86,7 +90,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "- 主通知只有拿到网关的受理确认才开始计时；回执不明标记为 "
             "`receipt_unconfirmed`，查明前绝不触发升级。\n"
             "- 通知号是网关幂等键；API 重启后按数据库中的待办继续投递/查询。\n"
-            "- 确认与到期处理并发时，确认优先且不新建备班投递；已在途通知通过网关查询后如实显示。"
+            "- 确认与到期处理并发时，确认优先且不新建备班投递；已在途通知通过网关查询后如实显示。\n"
+            "- 柜级静默：按 `metadata.cabinet` 启停。静默期间未发起的通知暂缓投递，"
+            "已发起的按网关真实受理结果核查；确认期限照常计算，到期备班暂缓发送；"
+            "结束后已确认告警不补发，未确认的沿原通知号继续投递。"
         ),
         lifespan=lifespan,
     )
@@ -240,17 +247,93 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: Request,
         limit: int = Query(default=50, ge=1, le=200),
         status_filter: str | None = Query(default=None, alias="status"),
+        cabinet: str | None = Query(default=None, description="按 metadata.cabinet 过滤"),
     ) -> dict:
         db: Database = request.app.state.db
-        rows = db.query(
-            "SELECT alarm_no FROM alarms ORDER BY created_real DESC LIMIT ?", (limit,)
-        )
+        if cabinet is not None:
+            rows = db.query(
+                "SELECT alarm_no FROM alarms WHERE cabinet = ? ORDER BY created_real DESC LIMIT ?",
+                (cabinet.strip(), limit),
+            )
+        else:
+            rows = db.query(
+                "SELECT alarm_no FROM alarms ORDER BY created_real DESC LIMIT ?", (limit,)
+            )
         service: AlarmService = request.app.state.service
         now_real = parse_ts(utc_now())
         views = [service.snapshot(r["alarm_no"], now_real=now_real) for r in rows]
         if status_filter:
             views = [v for v in views if v["status"] == status_filter]
         return {"items": views, "total": len(views)}
+
+    # ------------------------------------------------------------- 柜级静默
+
+    CabinetPath = Path(min_length=1, max_length=128, description="柜号，对应告警的 metadata.cabinet")
+
+    @app.put(
+        "/silences/{cabinet}",
+        response_model=SilenceView,
+        tags=["静默"],
+        summary="开始按柜号静默（检修）",
+        description=(
+            "生效后，该柜尚未向网关发起的主/备通知暂缓投递；已发起的通知仍按网关真实受理"
+            "结果核查，不会冒称取消。确认期限照常计算，到期备班通知生成但暂缓发送。"
+            "重复调用幂等：已静默时返回原记录（`created=false`）。静默持久化，API 重启后仍生效。"
+        ),
+    )
+    def start_silence(
+        request: Request,
+        cabinet: str = CabinetPath,
+        payload: SilenceStart | None = None,
+    ) -> dict:
+        service: AlarmService = request.app.state.service
+        payload = payload or SilenceStart()
+        try:
+            return service.start_silence(cabinet, payload.reason, payload.silenced_by)
+        except InvalidStateError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.delete(
+        "/silences/{cabinet}",
+        response_model=SilenceStopView,
+        tags=["静默"],
+        summary="结束柜号静默",
+        description=(
+            "结束后，已确认告警的通知不再补发；未确认告警被暂缓的通知沿原通知号继续投递，"
+            "逾期备班通知仍至多发一次。幂等：未静默时返回 `was_silenced=false`。"
+        ),
+    )
+    def stop_silence(request: Request, cabinet: str = CabinetPath) -> dict:
+        service: AlarmService = request.app.state.service
+        try:
+            return service.stop_silence(cabinet)
+        except InvalidStateError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get(
+        "/silences",
+        response_model=SilenceList,
+        tags=["静默"],
+        summary="列出生效中的柜静默",
+    )
+    def list_silences(request: Request) -> SilenceList:
+        service: AlarmService = request.app.state.service
+        items = service.list_silences()
+        return SilenceList(items=items, total=len(items))
+
+    @app.get(
+        "/silences/{cabinet}",
+        response_model=SilenceView,
+        tags=["静默"],
+        summary="查询某柜的静默状态",
+        responses={404: {"description": "该柜当前未静默"}},
+    )
+    def get_silence(request: Request, cabinet: str = CabinetPath) -> dict:
+        service: AlarmService = request.app.state.service
+        view = service.get_silence(cabinet)
+        if view is None:
+            raise HTTPException(status_code=404, detail=f"cabinet {cabinet!r} is not silenced")
+        return view
 
     return app
 

@@ -79,13 +79,57 @@ class ConfirmRequest(BaseModel):
     note: str | None = Field(default=None, max_length=500)
 
 
+class SilenceStart(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={"example": {"reason": "供电柜检修，暂停告警通知", "silenced_by": "值班员 王工"}},
+    )
+
+    reason: str | None = Field(default=None, max_length=500, description="Why the cabinet is silenced (e.g. maintenance)")
+    silenced_by: str | None = Field(default=None, max_length=200, description="Operator who started the silence")
+
+
+class SilenceInfo(BaseModel):
+    cabinet: str
+    silenced_at: str
+    silenced_by: str | None = None
+    reason: str | None = None
+
+
+class SilenceView(SilenceInfo):
+    silenced: bool = True
+    held_notifications: int = Field(
+        default=0, description="Notifications currently held back (never dispatched) by this silence"
+    )
+    created: bool | None = Field(
+        default=None, description="True when this call started the silence; false if it was already active"
+    )
+
+
+class SilenceStopView(BaseModel):
+    cabinet: str
+    silenced: bool = False
+    was_silenced: bool = Field(description="False when the cabinet was not silenced (idempotent stop)")
+    released_notifications: int = Field(
+        default=0, description="Held notifications that became dispatchable again when the silence ended"
+    )
+
+
+class SilenceList(BaseModel):
+    items: list[SilenceView]
+    total: int
+
+
 class NotificationView(BaseModel):
     notification_no: str
     role: Literal["primary", "backup"]
     contact: Contact
     state: str = Field(description="pending | in_flight | unknown | accepted | failed | cancelled")
     display_status: str = Field(
-        description="Operator-facing state: queued | sending | receipt_unconfirmed | accepted | rejected | cancelled_before_dispatch"
+        description=(
+            "Operator-facing state: queued | silenced_hold | sending | receipt_unconfirmed | "
+            "accepted | rejected | cancelled_before_dispatch"
+        )
     )
     display_text: str = Field(description="Human-readable Chinese status label")
     gateway_status: str | None = None
@@ -109,6 +153,15 @@ class AlarmView(BaseModel):
     status_text: str = Field(description="Human-readable Chinese status label")
     content: str
     metadata: dict[str, Any]
+    cabinet: str | None = Field(
+        default=None, description="metadata.cabinet, denormalised; cabinet silences key on this"
+    )
+    silenced: bool = Field(
+        default=False, description="True while this alarm's cabinet has an active silence"
+    )
+    silence: SilenceInfo | None = Field(
+        default=None, description="Active silence details for this alarm's cabinet, if any"
+    )
     primary_contact: Contact
     backup_contact: Contact
     ack_deadline_seconds: int

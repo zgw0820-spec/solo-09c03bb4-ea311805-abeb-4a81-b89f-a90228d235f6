@@ -89,7 +89,24 @@ pending ──POST──> in_flight ──网关 202 accepted──> accepted   
   网关去重保证最多一次投递。
 - pending/未知回执、未确认告警的到期扫描都从数据库重建，无内存队列可丢。
 
-### 6. 慢投递不影响其他告警
+### 6. 柜级静默（检修）
+
+`PUT /silences/{cabinet}` 按 `metadata.cabinet` 中的柜号开始静默，`DELETE` 结束，
+`GET /silences` 查看生效中的静默。语义：
+
+- **未发起的不投递**：生效后，该柜尚未向网关发起的主/备通知暂缓投递（显示
+  `silenced_hold`）。拦截点在投递认领的写事务内，与启停、确认严格串行；
+  其他柜照常通知。
+- **已发起的如实核查**：在途或回执不明的通知不受静默影响，继续按网关真实受理
+  结果核查，绝不冒称取消；网关无记录时的重投同样暂缓，静默结束后沿**原通知号**重试。
+- **期限照常**：静默期间主通知已受理的确认期限照常计算，到期备班通知照常生成
+  （告警标记 `escalated`），但发送暂缓，且仍至多发一次。
+- **结束后的去向**：已确认告警的通知不补发（确认时已同事务取消未投递行）；
+  未确认告警被暂缓的通知恢复投递。
+- 静默持久化在数据库中，API 重启后仍生效；查询告警可见 `silenced` 与
+  `silence` 字段及被暂缓的通知。
+
+### 7. 慢投递不影响其他告警
 
 - 投递是并行任务（`DELIVERY_CONCURRENCY`，默认 8），HTTP 调用不持有数据库锁。
 - 确认、查询、到期扫描都只做短事务，不等待网络。
@@ -100,11 +117,15 @@ pending ──POST──> in_flight ──网关 202 accepted──> accepted   
 | 方法 | 路径 | 用途 |
 |---|---|---|
 | POST | `/alarms` | 提交告警（201；幂等重试 200；内容冲突 409） |
-| GET | `/alarms/{alarm_no}` | 告警、通知、确认、计时状态 |
+| GET | `/alarms/{alarm_no}` | 告警、通知、确认、计时与静默状态 |
 | POST | `/alarms/{alarm_no}/confirm` | 确认（幂等） |
 | GET | `/alarms/{alarm_no}/notifications` | 该告警的通知明细 |
 | GET | `/notifications/{notification_no}` | 按通知号查询网关受理结果 |
-| GET | `/alarms` | 列出告警，可按 `status` 过滤 |
+| GET | `/alarms` | 列出告警，可按 `status`、`cabinet` 过滤 |
+| PUT | `/silences/{cabinet}` | 开始柜静默（幂等；`reason`、`silenced_by` 可选） |
+| DELETE | `/silences/{cabinet}` | 结束柜静默（幂等；返回释放的暂缓通知数） |
+| GET | `/silences` | 列出生效中的静默（含暂缓通知数） |
+| GET | `/silences/{cabinet}` | 查询某柜静默状态（未静默 404） |
 | GET | `/health` | 健康检查 |
 
 状态值：`primary_queued`、`primary_sending`、`primary_unconfirmed`、
@@ -160,6 +181,20 @@ sleep 5
 curl -s localhost:8000/alarms/DEMO-2 | python3 -m json.tool
 ```
 
+```bash
+# 3) 柜级静默：检修 A07 期间暂停该柜通知，结束后未确认的继续投递
+curl -X PUT localhost:8000/silences/A07 -H 'content-type: application/json' \
+  -d '{"reason":"供电柜检修","silenced_by":"值班员 王工"}'
+curl -X POST localhost:8000/alarms -H 'content-type: application/json' -d '{
+  "alarm_no":"DEMO-3","content":"供电柜 A07 温度 79°C",
+  "metadata":{"cabinet":"A07"},
+  "primary_contact":{"name":"主值班员","channel":"app"},
+  "backup_contact":{"name":"备班","channel":"sms"},
+  "ack_deadline_seconds":5}'
+curl -s localhost:8000/alarms/DEMO-3 | python3 -m json.tool   # silenced=true，通知 silenced_hold
+curl -X DELETE localhost:8000/silences/A07                    # 结束静默，暂缓通知恢复投递
+```
+
 ## 配置
 
 | 变量 | 默认 | 说明 |
@@ -179,14 +214,15 @@ curl -s localhost:8000/alarms/DEMO-2 | python3 -m json.tool
 ## 测试
 
 ```bash
-python -m pytest -q                     # 27 个测试，进程内假网关，真实 SQLite 文件
+python -m pytest -q                     # 37 个测试，进程内假网关，真实 SQLite 文件
 API_URL=http://localhost:8000 GATEWAY_URL=http://localhost:9000 \
   python -I scripts/smoke_test.py       # 对真实运行的服务做端到端冒烟
 ```
 
 覆盖：幂等提交与 409、计时起点、确认阻断升级、逾期仅一次、回执不明不升级、
 回执补查不重复投递、重启接续（三种中断点）、确认 vs 到期竞态、慢投递不阻塞、
-拒收处理、在途备班如实披露、Swagger/OpenAPI。
+拒收处理、在途备班如实披露、柜级静默（暂缓/核查/期限照常/结束后去向/重启保持）、
+旧库迁移、Swagger/OpenAPI。
 
 ## 已知限制
 

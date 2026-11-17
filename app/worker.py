@@ -271,6 +271,25 @@ class Dispatcher:
             # one delivery.
             misses = int(row.get("lookup_misses") or 0) + 1
             if misses >= self.not_found_misses_before_repost:
+                # A re-post is a new delivery to the gateway: it obeys the same
+                # rules as a first post. While the alarm is confirmed or its
+                # cabinet is silenced, the re-post is deferred and the row stays
+                # unknown — the gateway's record (or lack of it) keeps being
+                # checked, but no new page is initiated.
+                allowed, reason = self.service.repost_allowed(row["id"])
+                if not allowed:
+                    backoff = (
+                        3600.0 if reason == "alarm confirmed" else self.max_backoff_seconds
+                    )
+                    self.service.mark_notification(
+                        row["id"],
+                        "unknown",
+                        "not_found",
+                        f"gateway has no record after {misses} lookups; re-post deferred ({reason})",
+                        retry_at=time.time() + backoff,
+                        lookup_miss=True,
+                    )
+                    return
                 log.info(
                     "notification %s absent from gateway after %d lookups; re-posting",
                     row["notification_no"],

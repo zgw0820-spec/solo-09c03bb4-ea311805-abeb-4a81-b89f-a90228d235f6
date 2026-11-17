@@ -28,6 +28,9 @@ CREATE TABLE IF NOT EXISTS alarms (
     primary_contact           TEXT NOT NULL,
     backup_contact            TEXT NOT NULL,
     ack_deadline_seconds      INTEGER NOT NULL,
+    -- metadata.cabinet, denormalised so silence checks and filters stay plain
+    -- indexed lookups instead of per-row JSON extraction.
+    cabinet                   TEXT,
     created_at                TEXT NOT NULL,
     created_real              REAL NOT NULL,
     -- Set only once the gateway has confirmed that the primary notification
@@ -88,6 +91,17 @@ CREATE INDEX IF NOT EXISTS ix_notifications_due
 CREATE INDEX IF NOT EXISTS ix_alarms_deadline
     ON alarms(primary_ack_deadline_real);
 
+-- Active cabinet silences (maintenance windows). A row means the cabinet is
+-- silenced *now*; deleting the row ends the silence. Persisted like everything
+-- else, so a restart cannot lose an active silence.
+CREATE TABLE IF NOT EXISTS cabinet_silences (
+    cabinet       TEXT PRIMARY KEY,
+    silenced_at   TEXT NOT NULL,
+    silenced_real REAL NOT NULL,
+    silenced_by   TEXT,
+    reason        TEXT
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     alarm_no    TEXT NOT NULL,
@@ -127,6 +141,23 @@ class Database:
             self._conn.execute(
                 "ALTER TABLE notifications ADD COLUMN lookup_misses INTEGER NOT NULL DEFAULT 0"
             )
+        alarm_columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(alarms)").fetchall()
+        }
+        if "cabinet" not in alarm_columns:
+            self._conn.execute("ALTER TABLE alarms ADD COLUMN cabinet TEXT")
+            # Backfill from the stored payload so silences apply to alarms that
+            # were submitted before this column existed.
+            self._conn.execute(
+                "UPDATE alarms SET cabinet = CAST(json_extract(payload_json, '$.metadata.cabinet') AS TEXT) "
+                "WHERE cabinet IS NULL AND json_extract(payload_json, '$.metadata.cabinet') IS NOT NULL"
+            )
+        # Created here rather than in SCHEMA: on a pre-migration database the
+        # column only exists after the ALTER above has run.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_alarms_cabinet ON alarms(cabinet)"
+        )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

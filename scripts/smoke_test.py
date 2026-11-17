@@ -140,6 +140,35 @@ def main() -> int:
     status, single = call("GET", f"{API}/notifications/{notification_no}")
     check(status == 200 and single["notification_no"] == notification_no, "lookup by notification number")
 
+    print("[6] cabinet silence holds, then releases; confirmed alarms are not paged")
+    status, body = call("PUT", f"{API}/silences/A07", {"reason": "供电柜检修", "silenced_by": "王工"})
+    check(status == 200 and body["silenced"] is True and body["created"] is True, "silence started")
+    status, body = call("PUT", f"{API}/silences/A07", {"reason": "重复"})
+    check(status == 200 and body["created"] is False, "re-starting a silence is idempotent")
+
+    call("POST", f"{API}/alarms", payload(f"{RUN}-SIL", 3))
+    time.sleep(1.2)
+    _, view = call("GET", f"{API}/alarms/{RUN}-SIL")
+    check(view["silenced"] is True, "alarm view shows the active silence")
+    check(view["notifications"][0]["state"] == "pending", "primary held while silenced")
+    check(view["notifications"][0]["display_status"] == "silenced_hold", "held state is visible")
+    check(gateway_records(f"{RUN}-SIL") == [], "nothing delivered while silenced")
+    _, sil = call("GET", f"{API}/silences/A07")
+    check(sil["held_notifications"] == 1, "silence view reports the held notification")
+
+    status, body = call("DELETE", f"{API}/silences/A07")
+    check(status == 200 and body["was_silenced"] is True, "silence ended")
+    view = wait_for(f"{RUN}-SIL", lambda v: v["primary_accepted_at"] is not None)
+    check(len(gateway_records(f"{RUN}-SIL")) == 1, "held primary delivered exactly once after release")
+
+    call("PUT", f"{API}/silences/A07", {"reason": "检修"})
+    call("POST", f"{API}/alarms", payload(f"{RUN}-SILCF", 3))
+    status, body = call("POST", f"{API}/alarms/{RUN}-SILCF/confirm", {"confirmed_by": "张工"})
+    check(status == 200 and body["status"] == "confirmed", "alarm confirmed during silence")
+    call("DELETE", f"{API}/silences/A07")
+    time.sleep(1.2)
+    check(gateway_records(f"{RUN}-SILCF") == [], "confirmed alarm is not paged after silence ends")
+
     print("smoke test passed")
     return 0
 

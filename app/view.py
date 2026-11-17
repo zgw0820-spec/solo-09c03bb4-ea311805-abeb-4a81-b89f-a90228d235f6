@@ -7,6 +7,11 @@ state is phrased. Two rules matter:
   the escalation clock is running.
 * an in-flight notification that could not be recalled after a late
   confirmation is reported as such, with the gateway's actual result once known.
+
+Cabinet silences add a third rule: a notification that has never been handed
+to the gateway while its cabinet is silenced is shown as held
+(``silenced_hold``) — it is queued work, not a cancelled one, and it will be
+delivered when the silence ends unless the alarm is confirmed first.
 """
 
 from __future__ import annotations
@@ -44,7 +49,7 @@ def _load(raw: str | None, default: Any) -> Any:
         return default
 
 
-def _notification_view(row: dict[str, Any], confirmed_at: str | None) -> dict[str, Any]:
+def _notification_view(row: dict[str, Any], confirmed_at: str | None, silenced: bool) -> dict[str, Any]:
     state = row["state"]
     display, display_text = NOTIFICATION_DISPLAY.get(state, (state, state))
     accepted_at = row.get("accepted_at")
@@ -55,7 +60,12 @@ def _notification_view(row: dict[str, Any], confirmed_at: str | None) -> dict[st
         and confirmed_at
         and accepted_at > confirmed_at
     )
-    if row["role"] == "backup" and state == "cancelled":
+    if state == "pending" and silenced:
+        # Never handed to the gateway and currently held by a cabinet silence.
+        display, display_text = "silenced_hold", "静默中，暂缓投递"
+    elif row["role"] == "primary" and state == "cancelled":
+        display_text = "未投递即取消（告警已确认）"
+    elif row["role"] == "backup" and state == "cancelled":
         display_text = "未投递即取消（确认早于发送）"
     elif delivered_after_confirmation:
         display_text = "确认后才被网关受理（在途，无法撤回）"
@@ -84,6 +94,7 @@ def build_alarm_view(
     events: list[dict[str, Any]],
     *,
     now_real: float,
+    silence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     by_role = {n["role"]: n for n in notifications}
     primary = by_role.get("primary")
@@ -92,6 +103,8 @@ def build_alarm_view(
     confirmed = alarm["confirmed_at"] is not None
     escalated = alarm["escalated_at"] is not None
     accepted_real = alarm.get("primary_accepted_real")
+    cabinet = alarm.get("cabinet")
+    silenced = silence is not None
 
     warnings: list[str] = []
     if confirmed and escalated:
@@ -123,6 +136,8 @@ def build_alarm_view(
         warnings.append("主通知回执不明，正在向网关查询受理结果；查明前不会触发升级。")
     if primary is not None and primary["state"] == "failed":
         warnings.append("网关明确拒收主通知，系统不会自动重发，请人工核实主备联系人。")
+    if primary is not None and primary["state"] == "cancelled":
+        warnings.append("主通知未投递即取消（告警已确认）。")
     if backup is not None and backup["state"] in {"in_flight", "unknown"}:
         warnings.append("备班通知已提交且在途，受理结果正在向网关查明，请以查询结果为准。")
     if (
@@ -138,6 +153,22 @@ def build_alarm_view(
         warnings.append("告警已确认，排队中的备班通知未投递即取消。")
     if backup is not None and backup["state"] == "failed":
         warnings.append("网关拒收备班通知，升级投递失败，需人工通知备班。")
+    if silenced:
+        held = sum(1 for n in notifications if n["state"] == "pending")
+        label = f"柜 {cabinet} 静默中"
+        if silence.get("reason"):
+            label += f"（{silence['reason']}）"
+        if held:
+            warnings.append(
+                f"{label}：{held} 条通知暂缓投递；静默结束后，未确认告警的通知将继续投递，"
+                "已确认告警不再补发。"
+            )
+        else:
+            warnings.append(f"{label}。")
+        if escalated and backup is not None and backup["state"] == "pending":
+            warnings.append("确认期限已到期，备班通知已生成但因静默暂缓发送。")
+        if any(n["state"] in {"in_flight", "unknown"} for n in notifications):
+            warnings.append("已发起的通知不受静默影响，仍按网关真实受理结果核查，不会冒称取消。")
 
     seconds_until: float | None = None
     if (
@@ -153,6 +184,18 @@ def build_alarm_view(
         "status_text": ALARM_STATUS_TEXT.get(status, status),
         "content": _load(alarm["payload_json"], {}).get("content", ""),
         "metadata": _load(alarm["payload_json"], {}).get("metadata", {}),
+        "cabinet": cabinet,
+        "silenced": silenced,
+        "silence": (
+            {
+                "cabinet": silence["cabinet"],
+                "silenced_at": silence["silenced_at"],
+                "silenced_by": silence["silenced_by"],
+                "reason": silence["reason"],
+            }
+            if silence
+            else None
+        ),
         "primary_contact": _load(alarm["primary_contact"], {}),
         "backup_contact": _load(alarm["backup_contact"], {}),
         "ack_deadline_seconds": alarm["ack_deadline_seconds"],
@@ -166,7 +209,7 @@ def build_alarm_view(
         "escalated": escalated,
         "escalated_at": alarm.get("escalated_at"),
         "notifications": [
-            _notification_view(n, alarm.get("confirmed_at")) for n in notifications
+            _notification_view(n, alarm.get("confirmed_at"), silenced) for n in notifications
         ],
         "events": events,
         "warnings": warnings,
